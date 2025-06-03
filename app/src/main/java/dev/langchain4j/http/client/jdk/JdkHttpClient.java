@@ -8,33 +8,28 @@ import dev.langchain4j.http.client.SuccessfulHttpResponse;
 import dev.langchain4j.http.client.sse.ServerSentEventListener;
 import dev.langchain4j.http.client.sse.ServerSentEventParser;
 
-import java.io.BufferedReader;
+import okhttp3.*;
+import okhttp3.internal.http2.StreamResetException;
+
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.net.URI;
-import java.net.http.HttpRequest.BodyPublisher;
-import java.net.http.HttpRequest.BodyPublishers;
-import java.net.http.HttpResponse.BodyHandlers;
-import java.net.http.HttpTimeoutException;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 
 import static dev.langchain4j.http.client.sse.ServerSentEventListenerUtils.ignoringExceptions;
 import static dev.langchain4j.internal.Utils.getOrDefault;
-import static java.util.stream.Collectors.joining;
 
 public class JdkHttpClient implements HttpClient {
 
-    private final java.net.http.HttpClient delegate;
+    private final OkHttpClient delegate;
     private final Duration readTimeout;
 
     public JdkHttpClient(JdkHttpClientBuilder builder) {
-        java.net.http.HttpClient.Builder httpClientBuilder =
-                getOrDefault(builder.httpClientBuilder(), java.net.http.HttpClient::newBuilder);
+        OkHttpClient.Builder okHttpClientBuilder = getOrDefault(builder.httpClientBuilder(), new OkHttpClient.Builder());
         if (builder.connectTimeout() != null) {
-            httpClientBuilder.connectTimeout(builder.connectTimeout());
+            okHttpClientBuilder.connectTimeout(builder.connectTimeout().toMillis(), TimeUnit.MILLISECONDS);
         }
-        this.delegate = httpClientBuilder.build();
+        this.delegate = okHttpClientBuilder.build();
         this.readTimeout = builder.readTimeout();
     }
 
@@ -45,97 +40,89 @@ public class JdkHttpClient implements HttpClient {
     @Override
     public SuccessfulHttpResponse execute(HttpRequest request) throws HttpException {
         try {
-            java.net.http.HttpRequest jdkRequest = toJdkRequest(request);
+            Request okHttpRequest = toOkHttpRequest(request);
 
-            java.net.http.HttpResponse<String> jdkResponse = delegate.send(jdkRequest, BodyHandlers.ofString());
+            try (Response okHttpResponse = delegate.newCall(okHttpRequest).execute()) {
+                if (!okHttpResponse.isSuccessful()) {
+                    throw new HttpException(okHttpResponse.code(), okHttpResponse.body() != null ? okHttpResponse.body().string() : null);
+                }
 
-            if (!isSuccessful(jdkResponse)) {
-                throw new HttpException(jdkResponse.statusCode(), jdkResponse.body());
+                String responseBody = okHttpResponse.body() != null ? okHttpResponse.body().string() : null;
+                return fromOkHttpResponse(okHttpResponse, responseBody);
             }
-
-            return fromJdkResponse(jdkResponse, jdkResponse.body());
-        } catch (HttpTimeoutException e) {
-            throw new TimeoutException(e);
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
+            if (e instanceof StreamResetException || e.getMessage().contains("timeout")) {
+                throw new TimeoutException(e);
+            }
             throw new RuntimeException(e);
         }
     }
 
     @Override
     public void execute(HttpRequest request, ServerSentEventParser parser, ServerSentEventListener listener) {
-        java.net.http.HttpRequest jdkRequest = toJdkRequest(request);
+        Request okHttpRequest = toOkHttpRequest(request);
 
-        delegate.sendAsync(jdkRequest, BodyHandlers.ofInputStream())
-                .thenAccept(jdkResponse -> {
+        delegate.newCall(okHttpRequest).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                if (e instanceof StreamResetException || e.getMessage().contains("timeout")) {
+                    ignoringExceptions(() -> listener.onError(new TimeoutException(e)));
+                } else {
+                    ignoringExceptions(() -> listener.onError(e));
+                }
+            }
 
-                    if (!isSuccessful(jdkResponse)) {
-                        HttpException exception = new HttpException(jdkResponse.statusCode(), readBody(jdkResponse));
-                        ignoringExceptions(() -> listener.onError(exception));
-                        return;
+            @Override
+            public void onResponse(Call call, Response response) {
+                if (!response.isSuccessful()) {
+                    HttpException exception = new HttpException(response.code(), readBody(response));
+                    ignoringExceptions(() -> listener.onError(exception));
+                    return;
+                }
+
+                SuccessfulHttpResponse successfulResponse = fromOkHttpResponse(response, null);
+                ignoringExceptions(() -> listener.onOpen(successfulResponse));
+
+                try (ResponseBody responseBody = response.body()) {
+                    if (responseBody != null) {
+                        parser.parse(responseBody.byteStream(), listener);
                     }
-
-                    SuccessfulHttpResponse response = fromJdkResponse(jdkResponse, null);
-                    ignoringExceptions(() -> listener.onOpen(response));
-
-                    try (InputStream inputStream = jdkResponse.body()) {
-                        parser.parse(inputStream, listener);
-                        ignoringExceptions(listener::onClose);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                })
-                .exceptionally(throwable -> {
-                    if (throwable.getCause() instanceof HttpTimeoutException) {
-                        ignoringExceptions(() -> listener.onError(new TimeoutException(throwable)));
-                    } else {
-                        ignoringExceptions(() -> listener.onError(throwable));
-                    }
-                    return null;
-                });
+                    ignoringExceptions(listener::onClose);
+                }
+            }
+        });
     }
 
-    private java.net.http.HttpRequest toJdkRequest(HttpRequest request) {
-        java.net.http.HttpRequest.Builder builder = java.net.http.HttpRequest.newBuilder()
-                .uri(URI.create(request.url()));
+    private Request toOkHttpRequest(HttpRequest request) {
+        Request.Builder builder = new Request.Builder()
+                .url(request.url());
 
         request.headers().forEach((name, values) -> {
             if (values != null) {
-                values.forEach(value -> builder.header(name, value));
+                values.forEach(value -> builder.addHeader(name, value));
             }
         });
 
-        BodyPublisher bodyPublisher;
         if (request.body() != null) {
-            bodyPublisher = BodyPublishers.ofString(request.body());
+            builder.method(request.method().name(), RequestBody.create(request.body(), MediaType.parse("application/json")));
         } else {
-            bodyPublisher = BodyPublishers.noBody();
-        }
-        builder.method(request.method().name(), bodyPublisher);
-
-        if (readTimeout != null) {
-            builder.timeout(readTimeout);
+            builder.method(request.method().name(), null);
         }
 
         return builder.build();
     }
 
-    private static SuccessfulHttpResponse fromJdkResponse(java.net.http.HttpResponse<?> response, String body) {
+    private static SuccessfulHttpResponse fromOkHttpResponse(Response response, String body) {
         return SuccessfulHttpResponse.builder()
-                .statusCode(response.statusCode())
-                .headers(response.headers().map())
+                .statusCode(response.code())
+                .headers(response.headers().toMultimap())
                 .body(body)
                 .build();
     }
 
-    private static boolean isSuccessful(java.net.http.HttpResponse<?> response) {
-        int statusCode = response.statusCode();
-        return statusCode >= 200 && statusCode < 300;
-    }
-
-    private static String readBody(java.net.http.HttpResponse<InputStream> response) {
-        try (InputStream inputStream = response.body();
-             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
-            return reader.lines().collect(joining(System.lineSeparator()));
+    private static String readBody(Response response) {
+        try (ResponseBody responseBody = response.body()) {
+            return responseBody != null ? responseBody.string() : "Cannot read error response body";
         } catch (IOException e) {
             return "Cannot read error response body: " + e.getMessage();
         }

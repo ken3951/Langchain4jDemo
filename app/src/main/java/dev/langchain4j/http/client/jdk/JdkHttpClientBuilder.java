@@ -1,20 +1,21 @@
 package dev.langchain4j.http.client.jdk;
 
 import dev.langchain4j.http.client.HttpClientBuilder;
+import okhttp3.OkHttpClient;
 
 import java.time.Duration;
 
 public class JdkHttpClientBuilder implements HttpClientBuilder {
 
-    private java.net.http.HttpClient.Builder httpClientBuilder;
+    private OkHttpClient.Builder httpClientBuilder;
     private Duration connectTimeout;
     private Duration readTimeout;
 
-    public java.net.http.HttpClient.Builder httpClientBuilder() {
+    public OkHttpClient.Builder httpClientBuilder() {
         return httpClientBuilder;
     }
 
-    public JdkHttpClientBuilder httpClientBuilder(java.net.http.HttpClient.Builder httpClientBuilder) {
+    public JdkHttpClientBuilder httpClientBuilder(OkHttpClient.Builder httpClientBuilder) {
         this.httpClientBuilder = httpClientBuilder;
         return this;
     }
